@@ -14,6 +14,8 @@ from src.core.config import LOG_DIR
 from src.db.connection import conectar_bd
 from src.db.cola import estado_cola as estado_cola_netflix, añadir_url_cola
 from src.db.max_cola import estado_cola as estado_cola_max
+from src.db.filmin_cola import estado_cola as estado_cola_filmin
+from src.db.disney_cola import estado_cola as estado_cola_disney
 from src.utils.consola import C, print_live
 from src.utils.texto import normalizar_url, extraer_id_netflix
 
@@ -52,14 +54,24 @@ def _manejador_signal(sig, frame):
         mx._ejecutando = False
     except Exception:
         pass
+    try:
+        import src.crawlers.filmin_crawler as fm
+        fm._ejecutando = False
+    except Exception:
+        pass
+    try:
+        import src.crawlers.disney_crawler as dn
+        dn._ejecutando = False
+    except Exception:
+        pass
 
 signal.signal(signal.SIGINT,  _manejador_signal)
 signal.signal(signal.SIGTERM, _manejador_signal)
 
 # =============================================================================
 # PLATAFORMAS DISPONIBLES
-# Añadir aquí las nuevas plataformas cuando estén listas.
-# session_file: ruta al JSON de sesión (None = no disponible aún)
+# Filmin no necesita session_file — se marca con session_file=None
+# y se gestiona con una clave especial 'sin_sesion'
 # =============================================================================
 
 PLATAFORMAS = [
@@ -67,24 +79,43 @@ PLATAFORMAS = [
         "id":           "netflix",
         "nombre":       "Netflix",
         "session_file": Path(__file__).parent / "sesiones" / "netflix_session.json",
+        "sin_sesion":   False,
     },
     {
         "id":           "max",
         "nombre":       "MAX",
         "session_file": Path(__file__).parent / "sesiones" / "max_session.json",
+        "sin_sesion":   False,
     },
-    # Futuras plataformas:
-    # {
-    #     "id":           "filmin",
-    #     "nombre":       "Filmin",
-    #     "session_file": Path(__file__).parent / "sesiones" / "filmin_session.json",
-    # },
+    {
+        "id":           "filmin",
+        "nombre":       "Filmin",
+        "session_file": None,
+        "sin_sesion":   True,   # No requiere autenticación
+    },
+    {
+        "id":           "disney",
+        "nombre":       "Disney+",
+        "session_file": None,
+        "sin_sesion":   True,   # No requiere autenticación
+        "sin_navegador": True,  # Usa requests, no Playwright
+    },
 ]
 
 
 def _plataformas_disponibles() -> list:
-    """Devuelve solo las plataformas con sesión activa."""
-    return [p for p in PLATAFORMAS if p["session_file"].exists()]
+    """
+    Devuelve las plataformas disponibles:
+    - Las que tienen session_file y el fichero existe
+    - Las que no requieren sesión (sin_sesion=True)
+    """
+    resultado = []
+    for p in PLATAFORMAS:
+        if p.get("sin_sesion"):
+            resultado.append(p)
+        elif p["session_file"] and p["session_file"].exists():
+            resultado.append(p)
+    return resultado
 
 
 # =============================================================================
@@ -144,6 +175,30 @@ def menu_estado_colas():
         except Exception as e:
             print_live(C.warn(f"  MAX: no disponible ({e})"))
 
+        # Filmin
+        try:
+            stats = estado_cola_filmin(cur)
+            print_live(f"  {C.BOLD}Filmin:{C.RESET}")
+            print_live(f"    {C.GREEN}Pendientes:{C.RESET}           {stats['pendientes']}")
+            print_live(f"    {C.RED}Errores (reintento):{C.RESET}  {stats['errores']}")
+            print_live(f"    {C.BLUE}Completados:{C.RESET}          {stats['completados']}")
+            print_live(f"    {C.YELLOW}Revisitas pendientes:{C.RESET} {stats['revisitas_pendientes']}")
+            print_live(f"    {C.GRAY}Sin catálogo:{C.RESET}         {stats['sin_catalogo']}")
+        except Exception as e:
+            print_live(C.warn(f"  Filmin: no disponible ({e})"))
+
+        # Disney+
+        try:
+            stats = estado_cola_disney(cur)
+            print_live(f"  {C.BOLD}Disney+:{C.RESET}")
+            print_live(f"    {C.GREEN}Pendientes:{C.RESET}           {stats['pendientes']}")
+            print_live(f"    {C.RED}Errores (reintento):{C.RESET}  {stats['errores']}")
+            print_live(f"    {C.BLUE}Completados:{C.RESET}          {stats['completados']}")
+            print_live(f"    {C.YELLOW}Revisitas pendientes:{C.RESET} {stats['revisitas_pendientes']}")
+            print_live(f"    {C.GRAY}Sin catálogo:{C.RESET}         {stats['sin_catalogo']}")
+        except Exception as e:
+            print_live(C.warn(f"  Disney+: no disponible ({e})"))
+
     finally:
         cur.close()
         conn.close()
@@ -162,6 +217,40 @@ def menu_semilla_netflix(cur, conn) -> None:
                 print_live(C.ok(f"Semilla añadida: {url_sem}"))
             else:
                 print_live(C.warn("URL no reconocida, omitida."))
+    except EOFError:
+        pass
+
+
+def menu_semilla_filmin(cur, conn) -> None:
+    """Añadir URL semilla a la cola de Filmin."""
+    from src.db.filmin_cola import añadir_url_cola as añadir_filmin
+    print_live(C.seccion("URL SEMILLA FILMIN (opcional)"))
+    try:
+        entrada = input(
+            f"  {C.CYAN}URL de Filmin{C.RESET} "
+            f"(ej: https://www.filmin.es/pelicula/titulo) [Enter = omitir]: "
+        ).strip()
+        if entrada:
+            añadir_filmin(cur, entrada, fuente="semilla")
+            conn.commit()
+            print_live(C.ok(f"Semilla añadida: {entrada}"))
+    except EOFError:
+        pass
+
+
+def menu_semilla_disney(cur, conn) -> None:
+    """Añadir URL semilla a la cola de Disney+."""
+    from src.db.disney_cola import añadir_url_cola as añadir_disney
+    print_live(C.seccion("URL SEMILLA DISNEY+ (opcional)"))
+    try:
+        entrada = input(
+            f"  {C.CYAN}URL de Disney+{C.RESET} "
+            f"(ej: https://www.disneyplus.com/es-es/browse/entity-xxxx) [Enter = omitir]: "
+        ).strip()
+        if entrada:
+            añadir_disney(cur, entrada, fuente="semilla")
+            conn.commit()
+            print_live(C.ok(f"Semilla añadida: {entrada}"))
     except EOFError:
         pass
 
@@ -210,7 +299,7 @@ def menu_limite() -> int | None:
                 return n
             print_live(C.warn("Debe ser un número mayor que 0."))
         except (ValueError, EOFError):
-            print_live(C.warn("Introduce un número válido o pulsa Enter."))
+            print_live(C.warn("Introduce un número entero válido o pulsa Enter."))
 
 
 def menu_pausas() -> tuple[int, int]:
@@ -251,7 +340,9 @@ def menu_revision_generos() -> bool:
 
 
 # =============================================================================
-# BUCLE COORDINADOR MULTIPLATAFORMA (Opción C)
+# BUCLE COORDINADOR MULTIPLATAFORMA
+# Un único proceso Firefox con un contexto aislado por plataforma.
+# Los contextos son completamente independientes (cookies, sesión, storage).
 # =============================================================================
 
 async def _bucle_multiplataforma(
@@ -265,27 +356,25 @@ async def _bucle_multiplataforma(
     """
     Bucle secuencial que alterna entre plataformas.
     Cada plataforma procesa UN título por turno, luego cede el control.
-    El turno de la siguiente plataforma no empieza hasta que la actual termina.
+    Usa un único browser Firefox con un contexto aislado por plataforma.
     """
     global _ejecutando
 
     from playwright.async_api import async_playwright
     import random
 
-    # Importar los módulos de cada plataforma
+    # ── Preparar funciones de cada crawler ────────────────────────────────────
     crawlers = {}
     for p in plataformas_activas:
         if p["id"] == "netflix":
             from src.crawlers.netflix_crawler import (
                 _procesar_titulo as nf_procesar,
-                _imprimir_resumen as nf_resumen,
             )
             from src.db.cola import (
                 siguiente_url as nf_siguiente,
                 marcar_en_proceso as nf_marcar_proceso,
                 marcar_error as nf_marcar_error,
             )
-            from src.db.generos import resolver_generos_titulo, obtener_mapeo
             crawlers["netflix"] = {
                 "procesar":       nf_procesar,
                 "siguiente":      nf_siguiente,
@@ -307,36 +396,87 @@ async def _bucle_multiplataforma(
                 "marcar_proceso": mx_marcar_proceso,
                 "marcar_error":   mx_marcar_error,
             }
+        elif p["id"] == "filmin":
+            from src.crawlers.filmin_crawler import (
+                _procesar_titulo as fm_procesar,
+            )
+            from src.db.filmin_cola import (
+                siguiente_url as fm_siguiente,
+                marcar_en_proceso as fm_marcar_proceso,
+                marcar_error as fm_marcar_error,
+            )
+            crawlers["filmin"] = {
+                "procesar":       fm_procesar,
+                "siguiente":      fm_siguiente,
+                "marcar_proceso": fm_marcar_proceso,
+                "marcar_error":   fm_marcar_error,
+            }
+        elif p["id"] == "disney":
+            from src.crawlers.disney_crawler import (
+                _procesar_titulo as dn_procesar,
+            )
+            from src.db.disney_cola import (
+                siguiente_url as dn_siguiente,
+                marcar_en_proceso as dn_marcar_proceso,
+                marcar_error as dn_marcar_error,
+            )
+            crawlers["disney"] = {
+                "procesar":       dn_procesar,
+                "siguiente":      dn_siguiente,
+                "marcar_proceso": dn_marcar_proceso,
+                "marcar_error":   dn_marcar_error,
+                "sin_navegador":  True,   # Usa requests, no Playwright
+            }
 
     procesados_total = 0
     resumen = {p["id"]: {"ok": 0, "error": 0, "sin_catalogo": 0} for p in plataformas_activas}
 
     async with async_playwright() as pw:
-        # Abrir un navegador y contexto por plataforma
+
+        # ── Un único browser compartido ────────────────────────────────────────
+        print_live(C.info("Iniciando Firefox..."))
+        browser = await pw.firefox.launch(
+            headless=True,
+            env={
+                "MOZ_DISABLE_GPU":       "1",
+                "MOZ_WEBRENDER":         "0",
+                "LIBGL_ALWAYS_SOFTWARE": "1",
+                "MOZ_HEADLESS":          "1",
+            },
+        )
+        print_live(C.ok("Firefox iniciado"))
+
+        # ── Un contexto aislado por plataforma ────────────────────────────────
         navegadores = {}
         for p in plataformas_activas:
             pid = p["id"]
-            print_live(C.info(f"Iniciando navegador para {p['nombre']}..."))
-            browser = await pw.firefox.launch(
-                headless=True,
-                env={
-                    "MOZ_DISABLE_GPU":       "1",
-                    "MOZ_WEBRENDER":         "0",
-                    "LIBGL_ALWAYS_SOFTWARE": "1",
-                    "MOZ_HEADLESS":          "1",
-                },
-            )
-            context = await browser.new_context(
-                storage_state=str(p["session_file"]),
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
-                    "Gecko/20100101 Firefox/140.0"
-                ),
-                viewport={"width": 1280, "height": 800},
-            )
+            if p.get("sin_navegador"):
+                # Disney+ usa requests — no necesita contexto Playwright
+                import requests as req_lib
+                session = req_lib.Session()
+                navegadores[pid] = {"context": None, "page": None, "session": session}
+                print_live(C.ok(f"{p['nombre']} listo (modo requests, sin navegador)"))
+                continue
+            print_live(C.info(f"Iniciando contexto para {p['nombre']}..."))
+            if p.get("sin_sesion"):
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
+                        "Gecko/20100101 Firefox/140.0"
+                    ),
+                )
+            else:
+                context = await browser.new_context(
+                    storage_state=str(p["session_file"]),
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
+                        "Gecko/20100101 Firefox/140.0"
+                    ),
+                    viewport={"width": 1280, "height": 800},
+                )
             page = await context.new_page()
-            navegadores[pid] = {"browser": browser, "context": context, "page": page}
-            print_live(C.ok(f"Navegador {p['nombre']} listo"))
+            navegadores[pid] = {"context": context, "page": page, "session": None}
+            print_live(C.ok(f"Contexto {p['nombre']} listo"))
 
         try:
             while _ejecutando:
@@ -344,7 +484,7 @@ async def _bucle_multiplataforma(
                     print_live(C.ok(f"Límite total de {limite} títulos alcanzado."))
                     break
 
-                turno_vacio = True  # si ninguna plataforma tiene trabajo
+                turno_vacio = True
 
                 for p in plataformas_activas:
                     if not _ejecutando:
@@ -374,7 +514,7 @@ async def _bucle_multiplataforma(
                         continue
 
                     turno_vacio = False
-                    url, _ = fila
+                    url = fila[0]
 
                     print_live(f"\n{'─'*60}")
                     print_live(C.info(
@@ -384,12 +524,23 @@ async def _bucle_multiplataforma(
                     ))
 
                     # ── Procesar título ────────────────────────────────────
-                    if pid == "netflix":
+                    if craw.get("sin_navegador"):
+                        # Disney+ — usa requests.Session en vez de page
+                        resultado = craw["procesar"](
+                            url, nav["session"], revision_generos
+                        )
+                    elif pid == "netflix":
                         resultado = await craw["procesar"](
                             nav["page"], url, revision_generos
                         )
-                    else:
-                        resultado = await craw["procesar"](nav["page"], url)
+                    elif pid == "filmin":
+                        resultado = await craw["procesar"](
+                            nav["page"], url, revision_generos
+                        )
+                    else:  # max
+                        resultado = await craw["procesar"](
+                            nav["page"], url, revision_generos
+                        )
 
                     # ── Contabilizar resultado ─────────────────────────────
                     if resultado == "sesion_caducada":
@@ -397,7 +548,6 @@ async def _bucle_multiplataforma(
                             f"[{nombre}] Sesión caducada. "
                             f"Ejecuta el login de {nombre} y reinicia."
                         ))
-                        # Desactivar esta plataforma del bucle
                         plataformas_activas = [
                             x for x in plataformas_activas if x["id"] != pid
                         ]
@@ -411,8 +561,8 @@ async def _bucle_multiplataforma(
                     elif resultado == "sin_catalogo":
                         resumen[pid]["sin_catalogo"] += 1
                     elif resultado == "ignorado":
-                        pass  # series de MAX, no cuentan
-                    else:  # error
+                        pass
+                    else:
                         resumen[pid]["error"] += 1
                         conn = conectar_bd()
                         cur  = conn.cursor()
@@ -423,24 +573,32 @@ async def _bucle_multiplataforma(
                             cur.close()
                             conn.close()
 
-                    # ── Pausa entre títulos ────────────────────────────────
                     if _ejecutando:
                         pausa = random.uniform(pausa_min, pausa_max)
                         print_live(C.info(f"Pausa {pausa:.1f}s..."))
                         await asyncio.sleep(pausa)
 
-                # Si ninguna plataforma tenía trabajo, esperar antes de reintentar
                 if turno_vacio and _ejecutando:
                     print_live(C.warn("Todas las colas vacías. Esperando 60s..."))
                     await asyncio.sleep(60)
 
         finally:
-            # Cerrar todos los navegadores
+            # Cerrar contextos Playwright y sessions requests
             for pid, nav in navegadores.items():
-                try:
-                    await nav["browser"].close()
-                except Exception:
-                    pass
+                if nav.get("session"):
+                    try:
+                        nav["session"].close()
+                    except Exception:
+                        pass
+                if nav.get("context"):
+                    try:
+                        await nav["context"].close()
+                    except Exception:
+                        pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
     # ── Resumen final ──────────────────────────────────────────────────────
     print_live(C.seccion("RESUMEN FINAL"))
@@ -497,12 +655,10 @@ def main():
         ))
 
     else:
-        # Plataforma única — comportamiento original
         p = next(x for x in disponibles if x["id"] == plataforma_sel)
         print_live(C.seccion(f"MODO PLATAFORMA ÚNICA — {p['nombre']}"))
 
         if plataforma_sel == "netflix":
-            # Ofrecer semilla solo para Netflix individual
             conn_tmp = conectar_bd()
             cur_tmp  = conn_tmp.cursor()
             menu_semilla_netflix(cur_tmp, conn_tmp)
@@ -525,6 +681,39 @@ def main():
                 limite=limite,
                 pausa_min=pausa_min,
                 pausa_max=pausa_max,
+                revision_generos=revision_generos,
+            ))
+
+        elif plataforma_sel == "filmin":
+            conn_tmp = conectar_bd()
+            cur_tmp  = conn_tmp.cursor()
+            menu_semilla_filmin(cur_tmp, conn_tmp)
+            cur_tmp.close()
+            conn_tmp.close()
+
+            from src.crawlers.filmin_crawler import crawl
+            asyncio.run(crawl(
+                modo=modo,
+                limite=limite,
+                pausa_min=pausa_min,
+                pausa_max=pausa_max,
+                revision_generos=revision_generos,
+            ))
+
+        elif plataforma_sel == "disney":
+            conn_tmp = conectar_bd()
+            cur_tmp  = conn_tmp.cursor()
+            menu_semilla_disney(cur_tmp, conn_tmp)
+            cur_tmp.close()
+            conn_tmp.close()
+
+            from src.crawlers.disney_crawler import crawl
+            asyncio.run(crawl(
+                modo=modo,
+                limite=limite,
+                pausa_min=pausa_min,
+                pausa_max=pausa_max,
+                revision_generos=revision_generos,
             ))
 
         else:
