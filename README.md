@@ -1,39 +1,172 @@
-Purpose & context
-Ángel is building a personal streaming catalog management system, currently focused on Netflix, with plans to expand to other platforms (Prime, Disney+, Max). The project's goal is a fully searchable local catalog enriched with metadata, poster images, and IMDb data. The system runs across two machines: a desktop PC used for development and running the crawler, and an always-on laptop hosting the production MariaDB database (netflix_catalogo) and serving the web viewer. Ángel uses a locally-running Devstral Small 2 24B model via Ollama (on an RTX 5080 16GB GPU) for semantic data extraction during crawling.
-Current state
-The project has undergone a major schema redesign: separate peliculas and series tables were unified into a single titulos table, with shared relational tables (titulos_personas, titulos_generos, titulos_idiomas). This enables cross-content searches by actor, genre, and language. The migration script is migracion_v3.sql.
-The main crawler (main.py, formerly netflix_crawler_devstral.py) writes to the unified schema, downloads posters inline, and has a corrected content-type classification logic using a decision matrix combining _es_serie and es_doc signals. A companion script corregir_tipos.py retroactively fixes misclassified titles using num_temporadas as the sole reliable series indicator.
-The Flask web viewer (visor_catalogo.py) has been updated to the unified schema and features autocomplete search for actors/persons, genres, and audio languages (loaded once at startup, filtered client-side with accent-normalized matching). Android TV compatibility is in place via <a href="#"> card wrappers.
-IMDb integration is underway: imdb_importar.py downloads and imports the seven public IMDb TSV datasets into a local imdb database (filtered for relevant title types, Hispanic regions, and acting/directing roles). imdb_personas.py matches Netflix personas entries to IMDb nconst identifiers, adding imdb_id, birth_year, and death_year columns, with a two-mode startup menu (fully automatic vs. manual review of ambiguous matches).
-On the horizon
+# Catálogo de Streaming
 
-Complete and stabilize IMDb integration
-Add full series support with season/episode data (acknowledged as significantly more complex; plan is to analyze Netflix series page reactContext structure before designing schema and crawler)
-Normalize schema further before adding additional streaming platforms
-Build a unified cross-platform HTML viewer with search across all platforms
-Explore IMDb data enrichment for titles (via title.akas.tsv.gz filtered by region, joined on Spanish title + year to resolve tconst)
+Sistema personal de scraping, almacenamiento y consulta de metadatos de plataformas de streaming. Recorre los catálogos de **Netflix**, **MAX (HBO)**, **Filmin** y **Disney+**, extrae la información de cada título y la almacena en una base de datos MariaDB local con un visor web Flask.
 
-Key learnings & principles
+## Características
 
-num_temporadas is the only reliable signal for detecting series; genre keywords are not trustworthy for this purpose
-Netflix does not include a title's own BOXSHOT in its own page HTML — it only appears on other titles' pages that recommend it (drove decision to abandon inline thumbnail capture)
-MariaDB's consistent snapshot behavior under autocommit = False causes stale results; cursor recreation and explicit conn.commit() per iteration are required for background scripts that need to see newly inserted rows
-MariaDB ENUM fields silently ignore invalid values (insert empty string), so ENUM values must be used exactly
-GPU inference (~4 seconds/title) vs. CPU-only (~4 minutes/title) has a major practical impact on crawler scheduling; natural inference time reduces the need for long artificial pauses
-executemany bulk inserts on Windows with NULL values can fail; row-by-row fallback resolves this
+- **Crawlers independientes por plataforma** — cada plataforma tiene su propio crawler y extractor adaptado a la fuente de datos disponible (falcorCache en Netflix, HTML + Playwright en MAX/Filmin, `__NEXT_DATA__` JSON en Disney+).
+- **Cola de URLs auto-alimentada** — cada título procesado aporta URLs de títulos similares o recomendados, expandiendo el catálogo de forma orgánica sin necesidad de un índice previo.
+- **Sistema de géneros unificado** — las etiquetas y géneros de cada plataforma se normalizan a un catálogo canónico compartido mediante tablas de mapeo, con resolución interactiva de nuevos géneros.
+- **Visor web responsive** — interfaz Flask con filtros por plataforma, tipo, año, género, etiqueta, persona e idioma de audio. Incluye estadísticas, detalle modal de cada título y vista de estado de las colas.
+- **Enriquecimiento IMDb** — pipeline opcional para cruzar títulos con datos de IMDb (rating, votos, géneros, título original).
+- **Modo multiplataforma** — bucle coordinado que alterna entre plataformas procesando un título por turno de cada una.
 
-Approach & patterns
+## Arquitectura
 
-Iterative and pragmatic: Ángel reviews designs before coding, simplifies scope when complexity exceeds personal-use needs (e.g., dropped episode-level detail for series initially), and validates logic against real data
-Prefers clean production code over defensive checks once setup is complete (e.g., removing column-creation migration checks after columns exist)
-Catches logical errors by testing against real data and corrects them directly
-Gradual exploration of new ideas before committing to implementation
+```
+proyecto/
+├── main.py                    # Menú interactivo y orquestación
+├── visor_android.py           # Visor web Flask
+├── .env                       # Configuración (BD, pausas, perfil Netflix...)
+├── sesiones/                  # Scripts de login y archivos de sesión
+│   ├── netflix_login.py
+│   ├── netflix_session.json
+│   ├── max_login.py
+│   └── max_session.json
+└── src/
+    ├── core/
+    │   └── config.py          # Variables de entorno centralizadas
+    ├── crawlers/
+    │   ├── netflix_crawler.py # Playwright + falcorCache
+    │   ├── netflix_extractor.py
+    │   ├── max_crawler.py     # Playwright + HTML
+    │   ├── max_extractor.py
+    │   ├── filmin_crawler.py  # Playwright + ld+json / HTML
+    │   ├── filmin_extractor.py
+    │   ├── disney_crawler.py  # requests + __NEXT_DATA__ (sin navegador)
+    │   └── disney_extractor.py
+    ├── db/
+    │   ├── connection.py      # Conexión MariaDB
+    │   ├── cola.py            # Cola Netflix
+    │   ├── max_cola.py        # Cola MAX
+    │   ├── filmin_cola.py     # Cola Filmin
+    │   ├── disney_cola.py     # Cola Disney+
+    │   ├── titulos.py         # Repositorio Netflix
+    │   ├── max_titulos.py     # Repositorio MAX
+    │   ├── filmin_titulos.py  # Repositorio Filmin
+    │   ├── disney_titulos.py  # Repositorio Disney+
+    │   └── generos.py         # Géneros/etiquetas: mapeo y resolución interactiva
+    └── utils/
+        ├── consola.py         # Colores y formato de terminal
+        ├── texto.py           # Normalización de nombres y URLs
+        └── imagen_utils.py    # Optimización de pósters
+```
 
-Tools & resources
+## Plataformas soportadas
 
-Languages/frameworks: Python, Flask, MariaDB
-AI inference: Ollama with Devstral Small 2 24B (devstral-small-2:24b), Ollama API via /api/chat endpoint
-Hardware: Desktop PC with RTX 5080 16GB GPU (development/crawling); always-on laptop (production DB + web viewer)
-Data sources: Netflix static HTML + window.netflix.reactContext JSON; IMDb public TSV datasets (datasets.imdbws.com)
-MariaDB tuning: innodb_buffer_pool_size=1500M, innodb_flush_log_at_trx_commit=2, innodb_flush_method=O_DIRECT, query_cache_size=64M (configured for 4GB RAM machine)
-Environment: Windows with PowerShell (development)
+| Plataforma | Motor | Requiere login | Fuente de datos |
+|---|---|---|---|
+| Netflix | Playwright (Firefox) | Sí | `falcorCache` (JSON embebido) |
+| MAX (HBO) | Playwright (Firefox) | Sí | HTML renderizado |
+| Filmin | Playwright (Firefox) | No | `ld+json` (Schema.org) + HTML |
+| Disney+ | requests (sin navegador) | No | `__NEXT_DATA__` (Next.js JSON) |
+
+## Base de datos
+
+MariaDB con tablas separadas por plataforma y tablas compartidas:
+
+**Tablas por plataforma:**
+- `netflix_titulos`, `max_titulos`, `filmin_titulos`, `disney_titulos` — catálogo de cada plataforma
+- `netflix_cola`, `max_cola`, `filmin_cola`, `disney_cola` — cola de URLs pendientes con backoff exponencial
+- `netflix_generos_mapeo`, `max_generos_mapeo`, `filmin_generos_mapeo`, `disney_generos_mapeo` — mapeo de nombres de género de cada plataforma al catálogo canónico
+
+**Tablas compartidas:**
+- `personas` — actores, directores, creadores (con nombre normalizado)
+- `generos` — catálogo canónico de géneros y etiquetas
+- `idiomas` — idiomas de audio y subtítulos
+- `titulos_personas`, `titulos_generos`, `titulos_idiomas` — relaciones N:M con campo `plataforma`
+
+**Vista unificada:**
+- `v_catalogo` — UNION ALL de las cuatro tablas de títulos para consultas cruzadas
+
+## Requisitos
+
+- Python 3.11+
+- MariaDB 10.6+
+- Playwright (Firefox) — para Netflix, MAX y Filmin
+- Dependencias Python:
+
+```
+flask
+mariadb
+python-dotenv
+playwright
+requests
+Pillow
+```
+
+## Instalación
+
+1. Clonar el repositorio y crear el entorno:
+
+```bash
+git clone <url-del-repositorio>
+cd crawler
+pip install flask mariadb python-dotenv playwright requests Pillow
+playwright install firefox
+```
+
+2. Configurar la base de datos:
+
+```bash
+cp .env.example .env
+# Editar .env con las credenciales de MariaDB
+```
+
+3. Crear las tablas ejecutando los scripts SQL del proyecto.
+
+4. Para Netflix y MAX, generar las sesiones de login:
+
+```bash
+python sesiones/netflix_login.py
+python sesiones/max_login.py
+```
+
+## Uso
+
+### Crawler
+
+```bash
+python main.py
+```
+
+El menú interactivo permite seleccionar:
+- Plataforma (individual o modo rotación entre todas)
+- Modo de crawl (solo pendientes, pendientes + errores, ciclo completo con revisitas)
+- Límite de títulos por sesión
+- Pausas entre peticiones
+- Revisión interactiva de géneros nuevos
+
+### Visor web
+
+```bash
+python visor_android.py
+```
+
+Accesible en `http://localhost:3000` (configurable con `VISOR_PORT` en `.env`).
+
+## Variables de entorno
+
+| Variable | Descripción | Ejemplo |
+|---|---|---|
+| `DB_HOST` | Host de MariaDB | `192.168.2.10` |
+| `DB_PUERTO` | Puerto de MariaDB | `3306` |
+| `DB_USUARIO` | Usuario de MariaDB | `root` |
+| `DB_CONTRASENA` | Contraseña de MariaDB | `...` |
+| `DB_NOMBRE` | Nombre de la base de datos | `netflix_catalogo` |
+| `DIAS_REVISITA` | Días entre revisitas a títulos completados | `7` |
+| `MAX_INTENTOS` | Máximo de reintentos antes de descartar | `5` |
+| `REINICIO_CADA` | Reiniciar Firefox cada N títulos (Netflix) | `50` |
+| `NETFLIX_PROFILE` | ID del perfil de Netflix | `a5242` |
+| `PLAYWRIGHT_HEADLESS` | Ejecutar Firefox sin ventana | `true` |
+
+## Infraestructura
+
+El proyecto está diseñado para una red doméstica con dos máquinas:
+
+- **Portátil Debian** (`192.168.2.10`) — servidor MariaDB y visor Flask siempre encendido, accesible vía Nginx con SSL (Let's Encrypt)
+- **Escritorio Windows** — máquina de desarrollo donde se ejecutan los crawlers, con GPU para inferencia LLM local vía Ollama (usado en el pipeline de enriquecimiento IMDb)
+
+## Licencia
+
+Proyecto personal de uso privado.
